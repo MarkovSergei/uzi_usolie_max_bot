@@ -1,72 +1,128 @@
 import asyncio
+import requests
+import urllib3
 from datetime import datetime, timedelta
-from maxapi import Bot, Dispatcher, F
-from maxapi.filters.command import CommandStart
 
 import config
 import database
 
-bot = Bot(token=config.MAX_BOT_TOKEN)
-dp = Dispatcher()
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+API_URL = "https://platform-api2.max.ru"
+HEADERS = {"Authorization": config.MAX_BOT_TOKEN}
+
+# ------------------------- ОТПРАВКА -------------------------
+
+def send_message(chat_id, text, buttons=None):
+    """Отправка сообщения в MAX."""
+    url = f"{API_URL}/messages"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+    }
+
+    if buttons:
+        payload["attachments"] = [{
+            "type": "inline_keyboard",
+            "payload": {"buttons": buttons}
+        }]
+
+    try:
+        response = requests.post(url, json=payload, headers=HEADERS, timeout=10, verify=False)
+        return response.json()
+    except Exception as e:
+        print(f"Ошибка отправки: {e}")
+        return None
+
+def make_button(text, callback_data=None, url=None, link=False):
+    """Создание кнопки."""
+    if link:
+        return {"type": "link", "text": text, "url": url}
+    return {"type": "callback", "text": text, "payload": callback_data}
 
 # ------------------------- КЛАВИАТУРЫ -------------------------
 
-def get_main_keyboard():
-    """Главное меню для Макс."""
-    return {
-        "inline_keyboard": [
-            [{"text": "🩺 Виды УЗИ и цены", "callback_data": "menu_services"}],
-            [{"text": "❓ Вопросы и ответы", "callback_data": "menu_faq"}],
-            [{"text": "📅 Запланировать визит", "callback_data": "menu_plan"}],
-            [{"text": "🔔 Мои напоминания", "callback_data": "menu_reminders"}],
-            [{"text": "📍 Контакты и график", "callback_data": "menu_contacts"}],
-        ]
-    }
+def main_keyboard():
+    return [
+        [make_button("🩺 Виды УЗИ и цены", "menu_services")],
+        [make_button("❓ Вопросы и ответы", "menu_faq")],
+        [make_button("📅 Запланировать визит", "menu_plan")],
+        [make_button("🔔 Мои напоминания", "menu_reminders")],
+        [make_button("📍 Контакты и график", "menu_contacts")],
+    ]
 
-def get_back_keyboard(callback_data="menu_main"):
-    """Клавиатура с кнопкой Назад."""
-    return {
-        "inline_keyboard": [
-            [{"text": "← Назад", "callback_data": callback_data}],
-        ]
-    }
+def back_keyboard(callback_data="menu_main"):
+    return [[make_button("← Назад", callback_data)]]
 
-# ------------------------- ОБРАБОТЧИКИ -------------------------
+# ------------------------- ОБРАБОТКА -------------------------
 
-@dp.bot_started()
-async def on_start(event):
-    """Обработка старта."""
-    chat_id = event.chat_id
+def process_update(update):
+    update_type = update.get("update_type")
+    chat_id = update.get("chat_id")
 
-    conn = database.get_db()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR IGNORE INTO users (chat_id) VALUES (?)",
-        (str(chat_id),)
-    )
-    conn.commit()
-    conn.close()
+    if update_type == "bot_started":
+        conn = database.get_db()
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (str(chat_id),))
+        conn.commit()
+        conn.close()
 
-    text = (
-        "Здравствуйте!\n\n"
-        "Я бот кабинета УЗИ Маркова Сергея Борисовича.\n"
-        "Помогу узнать цены, подготовку к исследованиям и напомню о плановом визите.\n\n"
-        "Выберите действие в меню:"
-    )
-    await bot.send_message(chat_id=chat_id, text=text, attachments=[get_main_keyboard()])
+        text = (
+            "Здравствуйте!\n\n"
+            "Я бот кабинета УЗИ Маркова Сергея Борисовича.\n"
+            "Помогу узнать цены, подготовку к исследованиям и напомню о плановом визите.\n\n"
+            "Выберите действие в меню:"
+        )
+        send_message(chat_id, text, main_keyboard())
 
+    elif update_type == "message_created":
+        text = update.get("body", {}).get("text", "")
+        if text == "/start":
+            conn = database.get_db()
+            cursor = conn.cursor()
+            cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (str(chat_id),))
+            conn.commit()
+            conn.close()
 
-@dp.message_created(CommandStart())
-async def on_start_command(event):
-    """Обработка /start."""
-    await on_start(event)
+            welcome = (
+                "Здравствуйте!\n\n"
+                "Я бот кабинета УЗИ Маркова Сергея Борисовича.\n"
+                "Помогу узнать цены, подготовку к исследованиям и напомню о плановом визите.\n\n"
+                "Выберите действие в меню:"
+            )
+            send_message(chat_id, welcome, main_keyboard())
 
+    elif update_type == "message_callback":
+        payload = update.get("payload", "")
+        process_callback(chat_id, payload)
 
-@dp.callback_query(F.data == "menu_services")
-async def services_list(event):
-    """Список исследований."""
-    chat_id = event.chat_id
+def process_callback(chat_id, payload):
+    if payload == "menu_services":
+        show_services(chat_id)
+    elif payload.startswith("service_"):
+        show_service_detail(chat_id, int(payload.split("_")[1]))
+    elif payload == "menu_faq":
+        show_faq(chat_id)
+    elif payload.startswith("faq_"):
+        show_faq_answer(chat_id, int(payload.split("_")[1]))
+    elif payload == "menu_plan":
+        show_plan_services(chat_id)
+    elif payload.startswith("plan_service_"):
+        show_plan_periods(chat_id, int(payload.split("_")[2]))
+    elif payload.startswith("period_"):
+        save_plan_reminder(chat_id, int(payload.split("_")[1]), payload.split("_")[2])
+    elif payload.startswith("upd_"):
+        update_reminder(chat_id, int(payload.split("_")[1]), payload.split("_")[2])
+    elif payload == "menu_reminders":
+        show_my_reminders(chat_id)
+    elif payload == "menu_contacts":
+        show_contacts(chat_id)
+    elif payload == "menu_main":
+        send_message(chat_id, "Главное меню:", main_keyboard())
 
+# ------------------------- РАЗДЕЛЫ -------------------------
+
+def show_services(chat_id):
     conn = database.get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name FROM services WHERE is_active = 1 ORDER BY name")
@@ -74,60 +130,37 @@ async def services_list(event):
     conn.close()
 
     if not services:
-        await bot.send_message(chat_id=chat_id, text="Список пока пуст.")
+        send_message(chat_id, "Список пока пуст.")
         return
 
-    keyboard = []
+    buttons = []
     for s in services:
-        keyboard.append([{"text": s["name"], "callback_data": f"service_{s['id']}"}])
-    keyboard.append([{"text": "← Назад", "callback_data": "menu_main"}])
+        buttons.append([make_button(s["name"], f"service_{s['id']}")])
+    buttons.append([make_button("← Назад", "menu_main")])
 
-    await bot.send_message(
-        chat_id=chat_id,
-        text="Выберите исследование:",
-        attachments=[{"inline_keyboard": keyboard}]
-    )
+    send_message(chat_id, "Выберите исследование:", buttons)
 
-
-@dp.callback_query(F.data.startswith("service_"))
-async def service_detail(event):
-    """Детали исследования."""
-    service_id = int(event.data.split("_")[1])
-    chat_id = event.chat_id
-
+def show_service_detail(chat_id, service_id):
     conn = database.get_db()
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT name, description, price, preparation FROM services WHERE id = ?",
-        (service_id,)
-    )
+    cursor.execute("SELECT name, description, price, preparation FROM services WHERE id = ?", (service_id,))
     service = cursor.fetchone()
     conn.close()
 
     if not service:
-        await bot.send_message(chat_id=chat_id, text="Исследование не найдено.")
+        send_message(chat_id, "Исследование не найдено.")
         return
 
     text = f"🩺 {service['name']}\n\n"
-
     if service["description"]:
         text += f"ℹ️ {service['description']}\n\n"
-
     text += f"💰 Цена: {service['price']}\n\n"
-
     if service["preparation"]:
         text += f"📋 Подготовка:\n{service['preparation']}"
 
-    keyboard = {"inline_keyboard": [[{"text": "← Назад к списку", "callback_data": "menu_services"}]]}
+    send_message(chat_id, text, back_keyboard("menu_services"))
 
-    await bot.send_message(chat_id=chat_id, text=text, attachments=[keyboard])
-
-
-@dp.callback_query(F.data == "menu_faq")
-async def faq_list(event):
-    """Список вопросов."""
-    chat_id = event.chat_id
-
+def show_faq(chat_id):
     conn = database.get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT id, question FROM faq ORDER BY sort_order")
@@ -135,27 +168,17 @@ async def faq_list(event):
     conn.close()
 
     if not faqs:
-        await bot.send_message(chat_id=chat_id, text="Вопросы пока не добавлены.")
+        send_message(chat_id, "Вопросы пока не добавлены.")
         return
 
-    keyboard = []
+    buttons = []
     for f in faqs:
-        keyboard.append([{"text": f["question"], "callback_data": f"faq_{f['id']}"}])
-    keyboard.append([{"text": "← Назад", "callback_data": "menu_main"}])
+        buttons.append([make_button(f["question"], f"faq_{f['id']}")])
+    buttons.append([make_button("← Назад", "menu_main")])
 
-    await bot.send_message(
-        chat_id=chat_id,
-        text="Частые вопросы:",
-        attachments=[{"inline_keyboard": keyboard}]
-    )
+    send_message(chat_id, "Частые вопросы:", buttons)
 
-
-@dp.callback_query(F.data.startswith("faq_"))
-async def faq_answer(event):
-    """Ответ на вопрос."""
-    faq_id = int(event.data.split("_")[1])
-    chat_id = event.chat_id
-
+def show_faq_answer(chat_id, faq_id):
     conn = database.get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT question, answer FROM faq WHERE id = ?", (faq_id,))
@@ -163,21 +186,13 @@ async def faq_answer(event):
     conn.close()
 
     if not faq:
-        await bot.send_message(chat_id=chat_id, text="Вопрос не найден.")
+        send_message(chat_id, "Вопрос не найден.")
         return
 
     text = f"❓ {faq['question']}\n\n{faq['answer']}"
+    send_message(chat_id, text, back_keyboard("menu_faq"))
 
-    keyboard = {"inline_keyboard": [[{"text": "← Назад к вопросам", "callback_data": "menu_faq"}]]}
-
-    await bot.send_message(chat_id=chat_id, text=text, attachments=[keyboard])
-
-
-@dp.callback_query(F.data == "menu_plan")
-async def plan_start(event):
-    """Начало планирования."""
-    chat_id = event.chat_id
-
+def show_plan_services(chat_id):
     conn = database.get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name FROM services WHERE is_active = 1 ORDER BY name")
@@ -185,54 +200,30 @@ async def plan_start(event):
     conn.close()
 
     if not services:
-        await bot.send_message(chat_id=chat_id, text="Список исследований пока пуст.")
+        send_message(chat_id, "Список пока пуст.")
         return
 
-    keyboard = []
+    buttons = []
     for s in services:
-        keyboard.append([{"text": s["name"], "callback_data": f"plan_service_{s['id']}"}])
-    keyboard.append([{"text": "← Назад", "callback_data": "menu_main"}])
+        buttons.append([make_button(s["name"], f"plan_service_{s['id']}")])
+    buttons.append([make_button("← Назад", "menu_main")])
 
-    await bot.send_message(
-        chat_id=chat_id,
-        text="Выберите исследование:",
-        attachments=[{"inline_keyboard": keyboard}]
-    )
+    send_message(chat_id, "Выберите исследование:", buttons)
 
+def show_plan_periods(chat_id, service_id):
+    buttons = [
+        [make_button("1 месяц", f"period_{service_id}_1")],
+        [make_button("3 месяца", f"period_{service_id}_3")],
+        [make_button("6 месяцев", f"period_{service_id}_6")],
+        [make_button("12 месяцев", f"period_{service_id}_12")],
+        [make_button("← Назад", "menu_plan")],
+    ]
+    send_message(chat_id, "Через сколько напомнить?", buttons)
 
-@dp.callback_query(F.data.startswith("plan_service_"))
-async def plan_service_chosen(event):
-    """Исследование выбрано."""
-    service_id = int(event.data.split("_")[2])
-    chat_id = event.chat_id
-
-    # Сохраняем во временное хранилище
-    # Для простоты — передадим через callback_data
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": "1 месяц", "callback_data": f"period_{service_id}_1"}],
-            [{"text": "3 месяца", "callback_data": f"period_{service_id}_3"}],
-            [{"text": "6 месяцев", "callback_data": f"period_{service_id}_6"}],
-            [{"text": "12 месяцев", "callback_data": f"period_{service_id}_12"}],
-            [{"text": "← Назад", "callback_data": "menu_plan"}],
-        ]
-    }
-
-    await bot.send_message(chat_id=chat_id, text="Через сколько напомнить?", attachments=[keyboard])
-
-
-@dp.callback_query(F.data.startswith("period_"))
-async def plan_period_chosen(event):
-    """Период выбран."""
-    parts = event.data.split("_")
-    service_id = int(parts[1])
-    period = parts[2]
-    chat_id = event.chat_id
-
+def save_plan_reminder(chat_id, service_id, period):
     months = int(period)
     remind_date = (datetime.now() + timedelta(days=months * 30)).strftime("%d.%m.%Y")
 
-    # Сохраняем напоминание
     conn = database.get_db()
     cursor = conn.cursor()
 
@@ -243,15 +234,11 @@ async def plan_period_chosen(event):
     existing = cursor.fetchone()
 
     if existing:
-        keyboard = {"inline_keyboard": [
-            [{"text": "Да, обновить", "callback_data": f"upd_{service_id}_{remind_date}"}],
-            [{"text": "Отмена", "callback_data": "menu_main"}],
-        ]}
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"Уже запланировано на {existing['remind_date']}. Обновить?",
-            attachments=[keyboard]
-        )
+        buttons = [
+            [make_button("Да, обновить", f"upd_{service_id}_{remind_date}")],
+            [make_button("Отмена", "menu_main")],
+        ]
+        send_message(chat_id, f"Уже запланировано на {existing['remind_date']}. Обновить?", buttons)
         conn.close()
         return
 
@@ -271,18 +258,9 @@ async def plan_period_chosen(event):
         f"Напомню: {remind_date}\n\n"
         "За день до визита пришлю напоминание."
     )
+    send_message(chat_id, text, main_keyboard())
 
-    await bot.send_message(chat_id=chat_id, text=text, attachments=[get_main_keyboard()])
-
-
-@dp.callback_query(F.data.startswith("upd_"))
-async def update_reminder(event):
-    """Обновление напоминания."""
-    parts = event.data.split("_")
-    service_id = int(parts[1])
-    remind_date = parts[2]
-    chat_id = event.chat_id
-
+def update_reminder(chat_id, service_id, remind_date):
     conn = database.get_db()
     cursor = conn.cursor()
     cursor.execute(
@@ -292,18 +270,9 @@ async def update_reminder(event):
     conn.commit()
     conn.close()
 
-    await bot.send_message(
-        chat_id=chat_id,
-        text=f"✅ Дата обновлена!\n\nНапомню: {remind_date}",
-        attachments=[get_main_keyboard()]
-    )
+    send_message(chat_id, f"✅ Дата обновлена!\n\nНапомню: {remind_date}", main_keyboard())
 
-
-@dp.callback_query(F.data == "menu_reminders")
-async def my_reminders(event):
-    """Список напоминаний."""
-    chat_id = event.chat_id
-
+def show_my_reminders(chat_id):
     conn = database.get_db()
     cursor = conn.cursor()
     cursor.execute(
@@ -320,21 +289,16 @@ async def my_reminders(event):
     conn.close()
 
     if not reminders:
-        await bot.send_message(chat_id=chat_id, text="У вас нет активных напоминаний.")
+        send_message(chat_id, "У вас нет активных напоминаний.")
         return
 
     text = "Ваши напоминания:\n\n"
     for r in reminders:
         text += f"• {r['name']} — {r['remind_date']}\n"
 
-    await bot.send_message(chat_id=chat_id, text=text, attachments=[get_main_keyboard()])
+    send_message(chat_id, text, main_keyboard())
 
-
-@dp.callback_query(F.data == "menu_contacts")
-async def contacts(event):
-    """Контакты."""
-    chat_id = event.chat_id
-
+def show_contacts(chat_id):
     conn = database.get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT key, value FROM settings WHERE key IN ('address', 'work_hours', 'phone', 'map_link')")
@@ -347,23 +311,42 @@ async def contacts(event):
         f"📞 Телефон: {settings.get('phone', '')}"
     )
 
-    keyboard = {"inline_keyboard": [
-        [{"text": "🗺 Открыть на карте", "url": settings.get("map_link", "")}],
-        [{"text": "📲 Задать вопрос врачу", "url": "https://t.me/MarkovSerge"}],
-    ]}
+    buttons = [
+        [make_button("🗺 Открыть на карте", url=settings.get("map_link", ""), link=True)],
+        [make_button("📲 Задать вопрос врачу", url="https://t.me/MarkovSerge", link=True)],
+    ]
 
-    await bot.send_message(chat_id=chat_id, text=text, attachments=[keyboard])
-
-
-@dp.callback_query(F.data == "menu_main")
-async def menu_main(event):
-    """Главное меню."""
-    chat_id = event.chat_id
-    await bot.send_message(chat_id=chat_id, text="Главное меню:", attachments=[get_main_keyboard()])
-
+    send_message(chat_id, text, buttons)
 
 # ------------------------- ЗАПУСК -------------------------
 
 async def run_max_bot():
-    """Запуск polling для Макс."""
-    await dp.start_polling(bot)
+    print("MAX BOT STARTED")
+
+    # Проверка токена
+    try:
+        response = requests.get(f"{API_URL}/me", headers=HEADERS, timeout=10, verify=False)
+        print(f"MAX /me status: {response.status_code}")
+        print(f"MAX /me response: {response.text}")
+    except Exception as e:
+        print(f"MAX /me error: {e}")
+
+    # Long Polling
+    offset = 0
+    while True:
+        try:
+            url = f"{API_URL}/updates"
+            params = {"offset": offset}
+            response = requests.get(url, headers=HEADERS, params=params, timeout=60, verify=False)
+            data = response.json()
+            print(f"MAX updates: {data}")
+
+            updates = data.get("updates", [])
+            for update in updates:
+                process_update(update)
+                offset = max(offset, update.get("update_id", 0) + 1)
+
+        except Exception as e:
+            print(f"Ошибка polling MAX: {e}")
+
+        await asyncio.sleep(2)
