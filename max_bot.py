@@ -57,13 +57,18 @@ def back_keyboard(callback_data="menu_main"):
 # ------------------------- ОБРАБОТКА -------------------------
 
 def process_update(update):
+    """Обработка одного обновления от MAX."""
     update_type = update.get("update_type")
     chat_id = update.get("chat_id")
 
     if update_type == "bot_started":
+        # Регистрируем пользователя
         conn = database.get_db()
         cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (str(chat_id),))
+        cursor.execute(
+            "INSERT OR IGNORE INTO users (chat_id) VALUES (?)",
+            (str(chat_id),)
+        )
         conn.commit()
         conn.close()
 
@@ -76,12 +81,19 @@ def process_update(update):
         send_message(chat_id, text, main_keyboard())
 
     elif update_type == "message_created":
-    message = update.get("message", {})
-    text = message.get("body", {}).get("text", "")
+        # Обработка текстовых сообщений
+        message = update.get("message", {})
+        body = message.get("body", {})
+        text = body.get("text", "")
+
         if text == "/start":
+            # Регистрируем пользователя
             conn = database.get_db()
             cursor = conn.cursor()
-            cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (str(chat_id),))
+            cursor.execute(
+                "INSERT OR IGNORE INTO users (chat_id) VALUES (?)",
+                (str(chat_id),)
+            )
             conn.commit()
             conn.close()
 
@@ -94,10 +106,12 @@ def process_update(update):
             send_message(chat_id, welcome, main_keyboard())
 
     elif update_type == "message_callback":
+        # Обработка нажатий кнопок
         payload = update.get("payload", "")
         process_callback(chat_id, payload)
 
 def process_callback(chat_id, payload):
+    """Обработка callback-запросов."""
     if payload == "menu_services":
         show_services(chat_id)
     elif payload.startswith("service_"):
@@ -124,6 +138,7 @@ def process_callback(chat_id, payload):
 # ------------------------- РАЗДЕЛЫ -------------------------
 
 def show_services(chat_id):
+    """Список исследований."""
     conn = database.get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name FROM services WHERE is_active = 1 ORDER BY name")
@@ -142,9 +157,13 @@ def show_services(chat_id):
     send_message(chat_id, "Выберите исследование:", buttons)
 
 def show_service_detail(chat_id, service_id):
+    """Детали исследования."""
     conn = database.get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT name, description, price, preparation FROM services WHERE id = ?", (service_id,))
+    cursor.execute(
+        "SELECT name, description, price, preparation FROM services WHERE id = ?",
+        (service_id,)
+    )
     service = cursor.fetchone()
     conn.close()
 
@@ -162,6 +181,7 @@ def show_service_detail(chat_id, service_id):
     send_message(chat_id, text, back_keyboard("menu_services"))
 
 def show_faq(chat_id):
+    """Список вопросов."""
     conn = database.get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT id, question FROM faq ORDER BY sort_order")
@@ -180,6 +200,7 @@ def show_faq(chat_id):
     send_message(chat_id, "Частые вопросы:", buttons)
 
 def show_faq_answer(chat_id, faq_id):
+    """Ответ на вопрос."""
     conn = database.get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT question, answer FROM faq WHERE id = ?", (faq_id,))
@@ -194,6 +215,7 @@ def show_faq_answer(chat_id, faq_id):
     send_message(chat_id, text, back_keyboard("menu_faq"))
 
 def show_plan_services(chat_id):
+    """Список исследований для планирования."""
     conn = database.get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name FROM services WHERE is_active = 1 ORDER BY name")
@@ -212,6 +234,7 @@ def show_plan_services(chat_id):
     send_message(chat_id, "Выберите исследование:", buttons)
 
 def show_plan_periods(chat_id, service_id):
+    """Выбор периода."""
     buttons = [
         [make_button("1 месяц", f"period_{service_id}_1")],
         [make_button("3 месяца", f"period_{service_id}_3")],
@@ -222,6 +245,7 @@ def show_plan_periods(chat_id, service_id):
     send_message(chat_id, "Через сколько напомнить?", buttons)
 
 def save_plan_reminder(chat_id, service_id, period):
+    """Сохранение напоминания."""
     months = int(period)
     remind_date = (datetime.now() + timedelta(days=months * 30)).strftime("%d.%m.%Y")
 
@@ -262,6 +286,7 @@ def save_plan_reminder(chat_id, service_id, period):
     send_message(chat_id, text, main_keyboard())
 
 def update_reminder(chat_id, service_id, remind_date):
+    """Обновление напоминания."""
     conn = database.get_db()
     cursor = conn.cursor()
     cursor.execute(
@@ -274,6 +299,7 @@ def update_reminder(chat_id, service_id, remind_date):
     send_message(chat_id, f"✅ Дата обновлена!\n\nНапомню: {remind_date}", main_keyboard())
 
 def show_my_reminders(chat_id):
+    """Список напоминаний."""
     conn = database.get_db()
     cursor = conn.cursor()
     cursor.execute(
@@ -300,6 +326,7 @@ def show_my_reminders(chat_id):
     send_message(chat_id, text, main_keyboard())
 
 def show_contacts(chat_id):
+    """Контакты."""
     conn = database.get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT key, value FROM settings WHERE key IN ('address', 'work_hours', 'phone', 'map_link')")
@@ -322,6 +349,7 @@ def show_contacts(chat_id):
 # ------------------------- ЗАПУСК -------------------------
 
 async def run_max_bot():
+    """Long Polling для MAX."""
     print("MAX BOT STARTED")
 
     # Проверка токена
@@ -333,19 +361,22 @@ async def run_max_bot():
         print(f"MAX /me error: {e}")
 
     # Long Polling
-    offset = 0
+    marker = None
     while True:
         try:
             url = f"{API_URL}/updates"
-            params = {"offset": offset}
+            params = {}
+            if marker:
+                params["marker"] = marker
+
             response = requests.get(url, headers=HEADERS, params=params, timeout=60, verify=False)
             data = response.json()
-            print(f"MAX updates: {data}")
+
+            marker = data.get("marker", marker)
 
             updates = data.get("updates", [])
             for update in updates:
                 process_update(update)
-                offset = max(offset, update.get("update_id", 0) + 1)
 
         except Exception as e:
             print(f"Ошибка polling MAX: {e}")
