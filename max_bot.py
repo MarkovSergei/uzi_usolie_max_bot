@@ -76,7 +76,8 @@ def process_update(update):
         send_message(chat_id, text, main_keyboard())
 
     elif update_type == "message_created":
-        text = update.get("body", {}).get("text", "")
+    message = update.get("message", {})
+    text = message.get("body", {}).get("text", "")
         if text == "/start":
             conn = database.get_db()
             cursor = conn.cursor()
