@@ -3,17 +3,33 @@ import sqlite3
 import os
 import requests
 import urllib3
+import json
 from datetime import datetime, timedelta
+import time
 
+# Отключаем предупреждения SSL (для MAX API)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ==================== КОНФИГУРАЦИЯ ====================
 
 API_URL = "https://platform-api2.max.ru"
 TOKEN = os.getenv("MAX_BOT_TOKEN", "")
-HEADERS = {"Authorization": TOKEN}
+if not TOKEN:
+    print("⚠️ ВНИМАНИЕ: MAX_BOT_TOKEN не установлен!")
 
-DB_PATH = os.path.join(os.getenv("DATA_PATH", "/app/data"), "bot.db")
+HEADERS = {
+    "Authorization": TOKEN,
+    "Content-Type": "application/json"
+}
 
-# ------------------------- ДАННЫЕ -------------------------
+# Путь к БД на bothost.ru
+DATA_PATH = os.getenv("DATA_PATH", "/app/data")
+DB_PATH = os.path.join(DATA_PATH, "bot.db")
+
+# Создаем папку для БД, если её нет
+os.makedirs(DATA_PATH, exist_ok=True)
+
+# ==================== ДАННЫЕ ====================
 
 SERVICES = [
     {
@@ -215,41 +231,85 @@ CONTACTS = {
     "doctor_link": "https://t.me/MarkovSerge",
 }
 
-# ------------------------- БАЗА ДЛЯ НАПОМИНАНИЙ -------------------------
+# ==================== БАЗА ДАННЫХ ====================
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS reminders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id TEXT NOT NULL,
-            service_id INTEGER NOT NULL,
-            remind_date TEXT NOT NULL,
-            is_sent INTEGER DEFAULT 0
-        )
-    """)
-    conn.commit()
-    conn.close()
+    """Инициализация базы данных"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL,
+                service_id INTEGER NOT NULL,
+                remind_date TEXT NOT NULL,
+                is_sent INTEGER DEFAULT 0
+            )
+        """)
+        # Добавляем индекс для быстрого поиска
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_remind_date ON reminders(remind_date)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_id ON reminders(chat_id)")
+        conn.commit()
+        conn.close()
+        print(f"✅ База данных инициализирована: {DB_PATH}")
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка инициализации БД: {e}")
+        return False
 
-# ------------------------- ОТПРАВКА -------------------------
+# ==================== ОТПРАВКА СООБЩЕНИЙ ====================
 
-def send_message(chat_id, text, buttons=None):
+def send_message(chat_id, text, buttons=None, retries=3):
+    """Отправка сообщения с повторными попытками"""
     url = f"{API_URL}/messages"
     payload = {"chat_id": chat_id, "text": text}
+    
     if buttons:
-        payload["attachments"] = [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
-    try:
-        requests.post(url, json=payload, headers=HEADERS, timeout=10, verify=False)
-    except Exception as e:
-        print(f"Ошибка отправки: {e}")
+        # Формируем правильную структуру для MAX API
+        payload["attachments"] = [{
+            "type": "inline_keyboard",
+            "payload": {"buttons": buttons}
+        }]
+    
+    for attempt in range(retries):
+        try:
+            response = requests.post(
+                url, 
+                json=payload, 
+                headers=HEADERS, 
+                timeout=15,
+                verify=False
+            )
+            
+            if response.status_code == 200:
+                return True
+            
+            print(f"⚠️ Ошибка отправки (попытка {attempt+1}): {response.status_code} - {response.text}")
+            
+            # Если ошибка авторизации - нет смысла повторять
+            if response.status_code == 401:
+                print("❌ Ошибка авторизации! Проверьте MAX_BOT_TOKEN")
+                return False
+                
+        except requests.exceptions.Timeout:
+            print(f"⏱️ Таймаут отправки (попытка {attempt+1})")
+        except Exception as e:
+            print(f"⚠️ Ошибка отправки (попытка {attempt+1}): {e}")
+        
+        if attempt < retries - 1:
+            time.sleep(2 ** attempt)  # Экспоненциальная задержка
+    
+    return False
 
 def make_button(text, payload=None, url=None, link=False):
+    """Создание кнопки"""
     if link:
         return {"type": "link", "text": text, "url": url}
     return {"type": "callback", "text": text, "payload": payload}
 
 def main_keyboard():
+    """Главное меню"""
     return [
         [make_button("🩺 Виды УЗИ и цены", "menu_services")],
         [make_button("❓ Вопросы и ответы", "menu_faq")],
@@ -259,47 +319,83 @@ def main_keyboard():
     ]
 
 def back_keyboard(payload="menu_main"):
+    """Кнопка назад"""
     return [[make_button("← Назад", payload)]]
 
-# ------------------------- ОБРАБОТКА -------------------------
+# ==================== ОБРАБОТКА ОБНОВЛЕНИЙ ====================
 
 def process_update(update):
+    """Обработка входящего обновления"""
     update_type = update.get("update_type")
     chat_id = update.get("chat_id")
 
+    if not chat_id:
+        return
+
+    # Обработка запуска бота
     if update_type == "bot_started":
         send_message(
             chat_id,
-            "Здравствуйте!\n\nЯ бот кабинета УЗИ Маркова Сергея Борисовича.\n"
-            "Помогу узнать цены, подготовку и напомню о визите.\n\nВыберите действие:",
+            "👋 Здравствуйте!\n\n"
+            "Я бот кабинета УЗИ Маркова Сергея Борисовича.\n"
+            "Помогу узнать цены, подготовку и напомню о визите.\n\n"
+            "Выберите действие:",
             main_keyboard()
         )
+        return
 
-    elif update_type == "message_created":
+    # Обработка текстовых сообщений
+    if update_type == "message_created":
         message = update.get("message", {})
         body = message.get("body", {})
         text = body.get("text", "")
+        
         if text == "/start":
             send_message(
                 chat_id,
-                "Здравствуйте!\n\nЯ бот кабинета УЗИ Маркова Сергея Борисовича.\n"
-                "Помогу узнать цены, подготовку и напомню о визите.\n\nВыберите действие:",
+                "👋 Здравствуйте!\n\n"
+                "Я бот кабинета УЗИ Маркова Сергея Борисовича.\n"
+                "Помогу узнать цены, подготовку и напомню о визите.\n\n"
+                "Выберите действие:",
                 main_keyboard()
             )
+        elif text == "/help":
+            send_message(
+                chat_id,
+                "📖 Помощь:\n\n"
+                "• Используйте кнопки для навигации\n"
+                "• /start - главное меню\n"
+                "• /help - эта справка",
+                main_keyboard()
+            )
+        return
 
-    elif update_type == "message_callback":
+    # Обработка нажатий на кнопки
+    if update_type == "message_callback":
         payload = update.get("payload", "")
-        process_callback(chat_id, payload)
+        if payload:
+            process_callback(chat_id, payload)
 
 def process_callback(chat_id, payload):
-    if payload == "menu_services":
+    """Обработка callback-запросов"""
+    
+    # Главное меню
+    if payload == "menu_main":
+        send_message(chat_id, "Главное меню:", main_keyboard())
+    
+    # Услуги
+    elif payload == "menu_services":
         show_services(chat_id)
     elif payload.startswith("service_"):
         show_service_detail(chat_id, int(payload.split("_")[1]))
+    
+    # FAQ
     elif payload == "menu_faq":
         show_faq(chat_id)
     elif payload.startswith("faq_"):
         show_faq_answer(chat_id, int(payload.split("_")[1]))
+    
+    # Планирование
     elif payload == "menu_plan":
         show_plan_services(chat_id)
     elif payload.startswith("plan_service_"):
@@ -308,16 +404,19 @@ def process_callback(chat_id, payload):
         save_reminder(chat_id, int(payload.split("_")[1]), payload.split("_")[2])
     elif payload.startswith("upd_"):
         update_reminder(chat_id, int(payload.split("_")[1]), payload.split("_")[2])
+    
+    # Напоминания
     elif payload == "menu_reminders":
         show_reminders(chat_id)
+    
+    # Контакты
     elif payload == "menu_contacts":
         show_contacts(chat_id)
-    elif payload == "menu_main":
-        send_message(chat_id, "Главное меню:", main_keyboard())
 
-# ------------------------- РАЗДЕЛЫ -------------------------
+# ==================== РАЗДЕЛЫ МЕНЮ ====================
 
 def show_services(chat_id):
+    """Показать список услуг"""
     buttons = []
     for s in SERVICES:
         buttons.append([make_button(s["name"], f"service_{s['id']}")])
@@ -325,9 +424,10 @@ def show_services(chat_id):
     send_message(chat_id, "Выберите исследование:", buttons)
 
 def show_service_detail(chat_id, service_id):
+    """Показать детали услуги"""
     s = next((x for x in SERVICES if x["id"] == service_id), None)
     if not s:
-        send_message(chat_id, "Исследование не найдено.")
+        send_message(chat_id, "❌ Исследование не найдено.")
         return
 
     text = f"🩺 {s['name']}\n\n"
@@ -340,111 +440,151 @@ def show_service_detail(chat_id, service_id):
     send_message(chat_id, text, back_keyboard("menu_services"))
 
 def show_faq(chat_id):
+    """Показать список FAQ"""
     buttons = []
     for i, f in enumerate(FAQ):
-        buttons.append([make_button(f["question"], f"faq_{i}")])
+        # Обрезаем длинные вопросы
+        question = f["question"][:50] + "..." if len(f["question"]) > 50 else f["question"]
+        buttons.append([make_button(question, f"faq_{i}")])
     buttons.append([make_button("← Назад", "menu_main")])
-    send_message(chat_id, "Частые вопросы:", buttons)
+    send_message(chat_id, "❓ Частые вопросы:", buttons)
 
 def show_faq_answer(chat_id, index):
-    f = FAQ[index] if 0 <= index < len(FAQ) else None
-    if not f:
-        send_message(chat_id, "Вопрос не найден.")
+    """Показать ответ на FAQ"""
+    if not 0 <= index < len(FAQ):
+        send_message(chat_id, "❌ Вопрос не найден.")
         return
+    
+    f = FAQ[index]
     text = f"❓ {f['question']}\n\n{f['answer']}"
     send_message(chat_id, text, back_keyboard("menu_faq"))
 
 def show_plan_services(chat_id):
+    """Показать услуги для планирования"""
     buttons = []
     for s in SERVICES:
         buttons.append([make_button(s["name"], f"plan_service_{s['id']}")])
     buttons.append([make_button("← Назад", "menu_main")])
-    send_message(chat_id, "Выберите исследование:", buttons)
+    send_message(chat_id, "Выберите исследование для напоминания:", buttons)
 
 def show_plan_periods(chat_id, service_id):
+    """Показать выбор периода для напоминания"""
     buttons = [
-        [make_button("1 месяц", f"period_{service_id}_1")],
-        [make_button("3 месяца", f"period_{service_id}_3")],
-        [make_button("6 месяцев", f"period_{service_id}_6")],
-        [make_button("12 месяцев", f"period_{service_id}_12")],
+        [make_button("📅 1 месяц", f"period_{service_id}_1")],
+        [make_button("📅 3 месяца", f"period_{service_id}_3")],
+        [make_button("📅 6 месяцев", f"period_{service_id}_6")],
+        [make_button("📅 12 месяцев", f"period_{service_id}_12")],
         [make_button("← Назад", "menu_plan")],
     ]
     send_message(chat_id, "Через сколько напомнить?", buttons)
 
 def save_reminder(chat_id, service_id, period):
+    """Сохранить напоминание"""
     months = int(period)
     remind_date = (datetime.now() + timedelta(days=months * 30)).strftime("%d.%m.%Y")
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    cursor.execute(
-        "SELECT remind_date FROM reminders WHERE chat_id = ? AND service_id = ? AND is_sent = 0",
-        (str(chat_id), service_id)
-    )
-    existing = cursor.fetchone()
+    try:
+        # Проверяем существующее напоминание
+        cursor.execute(
+            "SELECT remind_date FROM reminders WHERE chat_id = ? AND service_id = ? AND is_sent = 0",
+            (str(chat_id), service_id)
+        )
+        existing = cursor.fetchone()
 
-    if existing:
-        buttons = [
-            [make_button("Да, обновить", f"upd_{service_id}_{remind_date}")],
-            [make_button("Отмена", "menu_main")],
-        ]
-        send_message(chat_id, f"Уже запланировано на {existing[0]}. Обновить?", buttons)
+        if existing:
+            buttons = [
+                [make_button("✅ Да, обновить", f"upd_{service_id}_{remind_date}")],
+                [make_button("❌ Отмена", "menu_main")],
+            ]
+            send_message(
+                chat_id, 
+                f"⚠️ Уже запланировано на {existing[0]}.\nОбновить?", 
+                buttons
+            )
+            conn.close()
+            return
+
+        # Сохраняем новое напоминание
+        cursor.execute(
+            "INSERT INTO reminders (chat_id, service_id, remind_date) VALUES (?, ?, ?)",
+            (str(chat_id), service_id, remind_date)
+        )
+        conn.commit()
+        
+        s = next((x for x in SERVICES if x["id"] == service_id), None)
+        name = s["name"] if s else "Исследование"
+
+        send_message(
+            chat_id,
+            f"✅ Запланировано!\n\n"
+            f"📋 Исследование: {name}\n"
+            f"📅 Напомню: {remind_date}\n\n"
+            f"🔔 За день до визита пришлю напоминание.",
+            main_keyboard()
+        )
+    except Exception as e:
+        print(f"❌ Ошибка сохранения напоминания: {e}")
+        send_message(chat_id, "❌ Произошла ошибка. Попробуйте позже.")
+    finally:
         conn.close()
-        return
-
-    cursor.execute(
-        "INSERT INTO reminders (chat_id, service_id, remind_date) VALUES (?, ?, ?)",
-        (str(chat_id), service_id, remind_date)
-    )
-    conn.commit()
-    conn.close()
-
-    s = next((x for x in SERVICES if x["id"] == service_id), None)
-    name = s["name"] if s else "Исследование"
-
-    send_message(
-        chat_id,
-        f"✅ Запланировано!\n\nИсследование: {name}\nНапомню: {remind_date}\n\n"
-        "За день до визита пришлю напоминание.",
-        main_keyboard()
-    )
 
 def update_reminder(chat_id, service_id, remind_date):
+    """Обновить напоминание"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE reminders SET remind_date = ? WHERE chat_id = ? AND service_id = ? AND is_sent = 0",
-        (remind_date, str(chat_id), service_id)
-    )
-    conn.commit()
-    conn.close()
-
-    send_message(chat_id, f"✅ Дата обновлена!\n\nНапомню: {remind_date}", main_keyboard())
+    
+    try:
+        cursor.execute(
+            "UPDATE reminders SET remind_date = ? WHERE chat_id = ? AND service_id = ? AND is_sent = 0",
+            (remind_date, str(chat_id), service_id)
+        )
+        conn.commit()
+        send_message(
+            chat_id, 
+            f"✅ Дата обновлена!\n\n📅 Напомню: {remind_date}", 
+            main_keyboard()
+        )
+    except Exception as e:
+        print(f"❌ Ошибка обновления: {e}")
+        send_message(chat_id, "❌ Ошибка обновления.")
+    finally:
+        conn.close()
 
 def show_reminders(chat_id):
+    """Показать активные напоминания"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT service_id, remind_date FROM reminders WHERE chat_id = ? AND is_sent = 0 ORDER BY remind_date",
-        (str(chat_id),)
-    )
-    reminders = cursor.fetchall()
-    conn.close()
+    
+    try:
+        cursor.execute(
+            "SELECT service_id, remind_date FROM reminders WHERE chat_id = ? AND is_sent = 0 ORDER BY remind_date",
+            (str(chat_id),)
+        )
+        reminders = cursor.fetchall()
+        
+        if not reminders:
+            send_message(chat_id, "📭 У вас нет активных напоминаний.", main_keyboard())
+            return
 
-    if not reminders:
-        send_message(chat_id, "У вас нет активных напоминаний.")
-        return
-
-    text = "Ваши напоминания:\n\n"
-    for r in reminders:
-        s = next((x for x in SERVICES if x["id"] == r[0]), None)
-        name = s["name"] if s else "Исследование"
-        text += f"• {name} — {r[1]}\n"
-
-    send_message(chat_id, text, main_keyboard())
+        text = "📋 Ваши напоминания:\n\n"
+        for r in reminders:
+            s = next((x for x in SERVICES if x["id"] == r[0]), None)
+            name = s["name"] if s else "Исследование"
+            text += f"• {name} — {r[1]}\n"
+        
+        text += "\n⌛ Напоминания приходят за день до даты."
+        send_message(chat_id, text, main_keyboard())
+    except Exception as e:
+        print(f"❌ Ошибка получения напоминаний: {e}")
+        send_message(chat_id, "❌ Ошибка получения напоминаний.")
+    finally:
+        conn.close()
 
 def show_contacts(chat_id):
+    """Показать контакты"""
     text = (
         f"📍 Адрес: {CONTACTS['address']}\n\n"
         f"🕒 Часы работы: {CONTACTS['work_hours']}\n\n"
@@ -453,32 +593,156 @@ def show_contacts(chat_id):
     buttons = [
         [make_button("🗺 Открыть на карте", url=CONTACTS["map_link"], link=True)],
         [make_button("📲 Задать вопрос врачу", url=CONTACTS["doctor_link"], link=True)],
+        [make_button("← Назад", "menu_main")],
     ]
     send_message(chat_id, text, buttons)
 
-# ------------------------- ЗАПУСК -------------------------
+# ==================== ПРОВЕРКА НАПОМИНАНИЙ ====================
+
+async def reminder_checker():
+    """Фоновая проверка напоминаний (каждый час)"""
+    print("🔄 Запущен планировщик напоминаний")
+    
+    while True:
+        try:
+            today = datetime.now().strftime("%d.%m.%Y")
+            
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            
+            # Находим напоминания на сегодня
+            cursor.execute(
+                "SELECT id, chat_id, service_id FROM reminders WHERE remind_date = ? AND is_sent = 0",
+                (today,)
+            )
+            reminders = cursor.fetchall()
+            
+            if reminders:
+                print(f"📨 Отправка {len(reminders)} напоминаний")
+                
+                for rid, chat_id, service_id in reminders:
+                    s = next((x for x in SERVICES if x["id"] == service_id), None)
+                    name = s["name"] if s else "исследование"
+                    
+                    text = (
+                        f"🔔 Напоминание!\n\n"
+                        f"Завтра у вас запланировано: {name}\n\n"
+                        f"📍 {CONTACTS['address']}\n\n"
+                        f"⏰ {CONTACTS['work_hours']}\n\n"
+                        f"Ждём вас! 🌟"
+                    )
+                    
+                    if send_message(chat_id, text):
+                        # Отмечаем как отправленное
+                        cursor.execute("UPDATE reminders SET is_sent = 1 WHERE id = ?", (rid,))
+                        print(f"✅ Напоминание {rid} отправлено")
+                    else:
+                        print(f"❌ Не удалось отправить напоминание {rid}")
+                
+                conn.commit()
+            
+            conn.close()
+            
+            # Ждем 1 час перед следующей проверкой
+            await asyncio.sleep(3600)
+            
+        except Exception as e:
+            print(f"❌ Ошибка в reminder_checker: {e}")
+            await asyncio.sleep(60)  # При ошибке ждем минуту
+
+# ==================== ЗАПУСК БОТА ====================
 
 async def run_max_bot():
-    print("MAX BOT STARTED")
-    init_db()
-
+    """Основная функция запуска бота"""
+    print("🚀 MAX BOT STARTING...")
+    
+    # Инициализация базы данных
+    if not init_db():
+        print("❌ Критическая ошибка: не удалось инициализировать БД")
+        return
+    
+    # Проверка токена
+    if not TOKEN:
+        print("❌ Ошибка: MAX_BOT_TOKEN не установлен!")
+        print("📌 Установите переменную окружения MAX_BOT_TOKEN")
+        return
+    
+    # Проверка подключения к MAX API
     try:
-        response = requests.get(f"{API_URL}/me", headers=HEADERS, timeout=10, verify=False)
-        print(f"MAX /me status: {response.status_code}")
+        response = requests.get(
+            f"{API_URL}/me", 
+            headers=HEADERS, 
+            timeout=10, 
+            verify=False
+        )
+        
+        if response.status_code == 200:
+            print("✅ Подключение к MAX API успешно")
+            try:
+                data = response.json()
+                print(f"🤖 Бот: {data.get('name', 'Unknown')}")
+            except:
+                pass
+        else:
+            print(f"⚠️ Ошибка подключения к MAX API: {response.status_code}")
+            print(f"Ответ: {response.text}")
     except Exception as e:
-        print(f"MAX /me error: {e}")
-
+        print(f"⚠️ Не удалось подключиться к MAX API: {e}")
+    
+    # Запускаем проверку напоминаний в фоне
+    asyncio.create_task(reminder_checker())
+    print("🔄 Планировщик напоминаний запущен")
+    
+    # Основной цикл получения обновлений
+    print("📡 Начинаем polling...")
     marker = None
+    error_count = 0
+    
     while True:
         try:
             params = {}
             if marker:
                 params["marker"] = marker
-            response = requests.get(f"{API_URL}/updates", headers=HEADERS, params=params, timeout=60, verify=False)
-            data = response.json()
-            marker = data.get("marker", marker)
-            for update in data.get("updates", []):
-                process_update(update)
+            
+            response = requests.get(
+                f"{API_URL}/updates", 
+                headers=HEADERS, 
+                params=params, 
+                timeout=30,
+                verify=False
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                marker = data.get("marker", marker)
+                
+                updates = data.get("updates", [])
+                if updates:
+                    print(f"📨 Получено {len(updates)} обновлений")
+                    for update in updates:
+                        process_update(update)
+                
+                error_count = 0  # Сбрасываем счетчик ошибок
+            else:
+                error_count += 1
+                print(f"⚠️ Ошибка polling: {response.status_code}")
+                if response.status_code == 401:
+                    print("❌ Ошибка авторизации! Проверьте токен.")
+                    await asyncio.sleep(60)
+                    continue
+                    
+        except requests.exceptions.Timeout:
+            error_count += 1
+            print(f"⏱️ Таймаут polling (ошибок: {error_count})")
         except Exception as e:
-            print(f"Ошибка polling MAX: {e}")
+            error_count += 1
+            print(f"⚠️ Ошибка polling: {e}")
+        
+        # Если слишком много ошибок - делаем паузу подольше
+        if error_count > 10:
+            print("🛑 Слишком много ошибок, пауза 60 секунд...")
+            await asyncio.sleep(60)
+            error_count = 0
+        
+        # Стандартная задержка
         await asyncio.sleep(2)
